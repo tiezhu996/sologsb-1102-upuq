@@ -5,16 +5,23 @@
 import { create } from 'zustand';
 import {
   ROW_REVISION,
+  commitMergeScenes,
+  commitUndoMerge,
+  getMergeSnapshot,
   listScenesByPlay,
+  previewMergeScenes,
+  previewUndoMerge,
   putScene,
   putScenes,
   removeScene,
+  type MergeSnapshotRow,
   type SceneRow,
 } from '../utils/db';
 import type { SceneDraft } from '../types/scene';
 import { clampProgress } from '../utils/timecode';
 import { nowIso, uuid } from '../utils/uuid';
 import { STORAGE_KEYS, readLocalFlag, writeLocalFlag } from '../utils/localStore';
+import type { MergePreviewResult, UndoPreviewResult } from '../utils/db';
 
 interface SceneStoreState {
   scenes: SceneRow[];
@@ -23,6 +30,8 @@ interface SceneStoreState {
   onlySelected: boolean;
   loading: boolean;
   error: string;
+  /** 当前剧目的合并快照（存在则可撤回最近一次合并） */
+  mergeSnapshot: MergeSnapshotRow | null;
   loadScenes: (playId: string) => Promise<void>;
   clearScenes: () => void;
   createScene: (playId: string, draft: SceneDraft) => Promise<SceneRow>;
@@ -36,6 +45,16 @@ interface SceneStoreState {
   selectAllScenes: () => void;
   clearSelection: () => void;
   setOnlySelected: (value: boolean) => void;
+  /** 加载当前剧目的合并快照 */
+  loadMergeSnapshot: (playId: string) => Promise<void>;
+  /** 合并预览（只读，冲突检测 + 结果预览） */
+  previewMerge: (playId: string, earlierId: string, laterId: string, mergedTitle: string) => Promise<MergePreviewResult>;
+  /** 提交合并（原子写入 + 快照） */
+  mergeScenes: (playId: string, earlierId: string, laterId: string, mergedTitle: string) => Promise<{ ok: boolean; conflictNames: string[] }>;
+  /** 撤回预览（判断是否被改动） */
+  previewUndo: (playId: string) => Promise<UndoPreviewResult>;
+  /** 提交撤回（原子恢复） */
+  undoMerge: (playId: string) => Promise<{ ok: boolean; changes: string[] }>;
   orderedScenes: () => SceneRow[];
   selectedScenes: () => SceneRow[];
   totalDurationMin: () => number;
@@ -49,6 +68,7 @@ export const useSceneStore = create<SceneStoreState>((set, get) => ({
   onlySelected: readLocalFlag(STORAGE_KEYS.sceneOnlySelected, false),
   loading: false,
   error: '',
+  mergeSnapshot: null,
 
   async loadScenes(playId) {
     set({ loading: true, error: '' });
@@ -174,6 +194,45 @@ export const useSceneStore = create<SceneStoreState>((set, get) => ({
   setOnlySelected(value) {
     set({ onlySelected: value });
     writeLocalFlag(STORAGE_KEYS.sceneOnlySelected, value);
+  },
+
+  async loadMergeSnapshot(playId) {
+    try {
+      const snapshot = await getMergeSnapshot(playId);
+      set({ mergeSnapshot: snapshot ?? null });
+    } catch {
+      set({ mergeSnapshot: null });
+    }
+  },
+
+  async previewMerge(playId, earlierId, laterId, mergedTitle) {
+    return previewMergeScenes(playId, earlierId, laterId, mergedTitle);
+  },
+
+  async mergeScenes(playId, earlierId, laterId, mergedTitle) {
+    const result = await commitMergeScenes(playId, earlierId, laterId, mergedTitle);
+    if (result.ok) {
+      await get().loadScenes(playId);
+      await get().loadMergeSnapshot(playId);
+      return { ok: true, conflictNames: [] };
+    }
+    return {
+      ok: false,
+      conflictNames: result.conflicts.map((item) => item.operatorName),
+    };
+  },
+
+  async previewUndo(playId) {
+    return previewUndoMerge(playId);
+  },
+
+  async undoMerge(playId) {
+    const result = await commitUndoMerge(playId);
+    if (result.ok) {
+      await get().loadScenes(playId);
+      await get().loadMergeSnapshot(playId);
+    }
+    return result;
   },
 
   orderedScenes() {

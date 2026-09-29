@@ -5,6 +5,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import {
+  Alert,
   App,
   Button,
   Checkbox,
@@ -30,6 +31,7 @@ import {
   SaveOutlined,
   SoundOutlined,
   TeamOutlined,
+  UndoOutlined,
 } from '@ant-design/icons';
 import { SceneCard } from '../components/common/SceneCard';
 import { EmptyState } from '../components/common/EmptyState';
@@ -41,7 +43,7 @@ import { ROUTES } from '../router';
 import { SHADOW_SCREEN_LABEL, SHADOW_SCREEN_OPTIONS, type SceneDraft, createEmptySceneDraft } from '../types/scene';
 import { minutesToReadable } from '../utils/timecode';
 import { formatStamp } from '../utils/uuid';
-import type { SceneRow } from '../utils/db';
+import type { MergePreviewResult, SceneRow } from '../utils/db';
 
 export default function SceneBoard() {
   const { id: playId = '' } = useParams<{ id: string }>();
@@ -75,6 +77,12 @@ export default function SceneBoard() {
   const bumpProgress = useSceneStore((state) => state.bumpProgress);
   const onlySelected = useSceneStore((state) => state.onlySelected);
   const setOnlySelected = useSceneStore((state) => state.setOnlySelected);
+  const mergeSnapshot = useSceneStore((state) => state.mergeSnapshot);
+  const loadMergeSnapshot = useSceneStore((state) => state.loadMergeSnapshot);
+  const previewMerge = useSceneStore((state) => state.previewMerge);
+  const mergeScenes = useSceneStore((state) => state.mergeScenes);
+  const previewUndo = useSceneStore((state) => state.previewUndo);
+  const undoMerge = useSceneStore((state) => state.undoMerge);
 
   const operators = useOperatorStore((state) => state.operators);
 
@@ -82,6 +90,10 @@ export default function SceneBoard() {
   const [draggingId, setDraggingId] = useState<string | null>(null);
   const [dropTargetId, setDropTargetId] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
+  const [mergeTarget, setMergeTarget] = useState<{ earlierId: string; laterId: string } | null>(null);
+  const [mergePreview, setMergePreview] = useState<MergePreviewResult | null>(null);
+  const [mergeTitle, setMergeTitle] = useState('');
+  const [mergeSubmitting, setMergeSubmitting] = useState(false);
 
   const play = plays.find((item) => item.id === playId) ?? null;
   const playStat = statOf(playId);
@@ -101,8 +113,17 @@ export default function SceneBoard() {
     if (playId && !loading) void syncSceneCount(playId);
   }, [playId, loading, syncSceneCount]);
 
+  useEffect(() => {
+    if (playId) void loadMergeSnapshot(playId);
+  }, [playId, loadMergeSnapshot, scenes.length]);
+
   const activeItem = useMemo(() => items.find((item) => item.scene.id === activeSceneId) ?? null, [items, activeSceneId]);
   const visibleItems = onlySelected ? items.filter((item) => selectedSceneIds.includes(item.scene.id)) : items;
+  const itemIndexMap = useMemo(() => {
+    const map = new Map<string, number>();
+    items.forEach((item, index) => map.set(item.scene.id, index));
+    return map;
+  }, [items]);
 
   const handleReorder = async (targetId: string) => {
     if (!draggingId || draggingId === targetId) return;
@@ -158,6 +179,110 @@ export default function SceneBoard() {
     });
   };
 
+  /** 点击「与下一场合并」：先做冲突检测，冲突则拒绝并点明角色 */
+  const handleMergeClick = async (earlierId: string, laterId: string) => {
+    if (!playId) return;
+    const earlier = scenes.find((scene) => scene.id === earlierId);
+    const later = scenes.find((scene) => scene.id === laterId);
+    if (!earlier || !later) return;
+    const result = await previewMerge(playId, earlierId, laterId, earlier.title);
+    if (!result.ok || !result.preview) {
+      message.error('合并预览失败，请重试');
+      return;
+    }
+    if (result.conflicts.length > 0) {
+      const conflictLines = result.conflicts.map(
+        (item) =>
+          `操耍人「${item.operatorName}」在「${item.earlierSceneTitle}」担纲「${item.earlierRoleName}」，又在「${item.laterSceneTitle}」担纲「${item.laterRoleName}」`,
+      );
+      modal.error({
+        title: '无法合并：同一操耍人兼顾两个角色',
+        width: 560,
+        content: (
+          <Space direction="vertical" size={6} style={{ marginTop: 8 }}>
+            <Typography.Text>
+              合并后以下操耍人将在同一场次里同时操耍两个影偶，无法兼顾。请先到「角色指派」调整指派后再合并。
+            </Typography.Text>
+            {conflictLines.map((line, index) => (
+              <Typography.Text key={index} type="danger" style={{ fontSize: 13 }}>
+                · {line}
+              </Typography.Text>
+            ))}
+          </Space>
+        ),
+        okText: '知道了',
+      });
+      return;
+    }
+    setMergeTarget({ earlierId, laterId });
+    setMergePreview(result);
+    setMergeTitle(earlier.title);
+  };
+
+  /** 确认合并：原子写入合并场次、角色、顺延鼓点 */
+  const handleMergeConfirm = async () => {
+    if (!playId || !mergeTarget) return;
+    setMergeSubmitting(true);
+    const result = await mergeScenes(playId, mergeTarget.earlierId, mergeTarget.laterId, mergeTitle);
+    setMergeSubmitting(false);
+    if (result.ok) {
+      message.success('合并完成，可在未改动前撤回');
+      setActiveSceneId(mergeTarget.earlierId);
+      setMergeTarget(null);
+      setMergePreview(null);
+    } else {
+      modal.error({
+        title: '合并失败',
+        content: result.conflictNames.length > 0 ? `冲突操耍人：${result.conflictNames.join('、')}` : '写入失败，请重试',
+      });
+    }
+  };
+
+  /** 撤回合并：未改动则可撤回，已改动则列出变化并拒绝 */
+  const handleUndoClick = async () => {
+    if (!playId) return;
+    const preview = await previewUndo(playId);
+    if (!preview.ok || !preview.snapshot) {
+      message.info('没有可撤回的合并');
+      return;
+    }
+    if (!preview.undoable) {
+      modal.error({
+        title: '无法撤回：合并后已有改动',
+        width: 560,
+        content: (
+          <Space direction="vertical" size={6} style={{ marginTop: 8 }}>
+            <Typography.Text>
+              合并后的场次 / 角色 / 锣鼓点已被修改，撤回会丢失这些改动。如需撤回，请先手动恢复后再操作。
+            </Typography.Text>
+            {preview.changes.map((change, index) => (
+              <Typography.Text key={index} type="warning" style={{ fontSize: 13 }}>
+                · {change}
+              </Typography.Text>
+            ))}
+          </Space>
+        ),
+        okText: '知道了',
+      });
+      return;
+    }
+    modal.confirm({
+      title: '撤回上次合并？',
+      content: '将恢复为合并前的两场独立场次，角色与锣鼓点一并还原。',
+      okText: '撤回合并',
+      cancelText: '取消',
+      onOk: async () => {
+        const result = await undoMerge(playId);
+        if (result.ok) {
+          message.success('已撤回，两场恢复原样');
+          setActiveSceneId(preview.snapshot?.scenes[0]?.id ?? null);
+        } else {
+          message.error('撤回失败，请重试');
+        }
+      },
+    });
+  };
+
   if (!play) {
     return (
       <div className="gb-panel">
@@ -188,6 +313,13 @@ export default function SceneBoard() {
           <Space wrap>
             <Button icon={<PlusOutlined />} type="primary" onClick={openCreate}>
               新增场次
+            </Button>
+            <Button
+              icon={<UndoOutlined />}
+              disabled={!mergeSnapshot}
+              onClick={() => void handleUndoClick()}
+            >
+              撤回合并
             </Button>
             <Button
               icon={<TeamOutlined />}
@@ -312,6 +444,13 @@ export default function SceneBoard() {
                           onDrop={() => {
                             void handleReorder(item.scene.id);
                           }}
+                          onMergeNext={
+                            (() => {
+                              const idx = itemIndexMap.get(item.scene.id) ?? -1;
+                              const next = idx >= 0 ? items[idx + 1] : undefined;
+                              return next ? () => void handleMergeClick(item.scene.id, next.scene.id) : undefined;
+                            })()
+                          }
                           extraActions={
                             <Tag color={selectedSceneIds.includes(item.scene.id) ? '#7a1f1f' : 'default'}>
                               {selectedSceneIds.includes(item.scene.id) ? '本次排练' : '本次跳过'}
@@ -384,6 +523,61 @@ export default function SceneBoard() {
             <Slider min={0} max={100} step={5} marks={{ 0: '0', 50: '50', 100: '100' }} />
           </Form.Item>
         </Form>
+      </Modal>
+
+      <Modal
+        open={mergeTarget !== null && mergePreview !== null}
+        title="合并相邻场次"
+        okText="确认合并"
+        cancelText="取消"
+        confirmLoading={mergeSubmitting}
+        onCancel={() => {
+          setMergeTarget(null);
+          setMergePreview(null);
+        }}
+        onOk={() => void handleMergeConfirm()}
+      >
+        {mergePreview && mergeTarget && mergePreview.preview ? (
+          <Space direction="vertical" size={10} style={{ width: '100%' }}>
+            <Alert
+              type="info"
+              showIcon
+              message={`将「${mergePreview.preview.earlier.title}」与「${mergePreview.preview.later.title}」合并为一场`}
+              description="合并后可在未改动前撤回；角色与锣鼓点会一并保留，后一场的鼓点按前一场时长顺延。"
+            />
+            <div>
+              <Typography.Text type="secondary">合并后场次标题</Typography.Text>
+              <Input value={mergeTitle} maxLength={40} onChange={(event) => setMergeTitle(event.target.value)} />
+            </div>
+            <Row gutter={12}>
+              <Col span={12}>
+                <Statistic
+                  title="合计时长"
+                  value={mergePreview.preview.mergedScene.durationMin}
+                  suffix="分钟"
+                  valueStyle={{ fontSize: 18 }}
+                />
+              </Col>
+              <Col span={12}>
+                <Statistic
+                  title="顺延鼓点"
+                  value={mergePreview.preview.offsetSeconds}
+                  suffix="秒"
+                  valueStyle={{ fontSize: 18 }}
+                />
+              </Col>
+            </Row>
+            <Space size={6} wrap>
+              <Tag color="gold">影人 {mergePreview.preview.mergedRoles.length} 个</Tag>
+              <Tag color="blue">锣鼓点 {mergePreview.preview.mergedCues.length} 处</Tag>
+              <Tag>影窗 {SHADOW_SCREEN_LABEL[mergePreview.preview.mergedScene.needsShadowScreen]}</Tag>
+              <Tag>进度 {mergePreview.preview.mergedScene.progress}%</Tag>
+            </Space>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              前一场鼓点保持原秒点，后一场鼓点顺延 {mergePreview.preview.offsetSeconds} 秒；场序自动重排。
+            </Typography.Text>
+          </Space>
+        ) : null}
       </Modal>
     </Space>
   );

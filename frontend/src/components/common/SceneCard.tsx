@@ -10,6 +10,7 @@ import {
   HolderOutlined,
   SoundOutlined,
   TeamOutlined,
+  MergeCellsOutlined,
 } from '@ant-design/icons';
 import type { SceneRow } from '../../utils/db';
 import { SHADOW_SCREEN_LABEL, maturityOf, MATURITY_COLOR, MATURITY_LABEL } from '../../types/scene';
@@ -42,6 +43,8 @@ export interface SceneCardProps {
   onToggleSelect?: (checked: boolean) => void;
   onEdit?: () => void;
   onDelete?: () => void;
+  /** 与下一场合并（最后一场不显示） */
+  onMergeNext?: () => void;
   /** 拖拽事件透传，由页面处理排序逻辑 */
   onDragStart?: (event: DragEvent<HTMLDivElement>) => void;
   onDragOver?: (event: DragEvent<HTMLDivElement>) => void;
@@ -67,6 +70,7 @@ export function SceneCard({
   onToggleSelect,
   onEdit,
   onDelete,
+  onMergeNext,
   onDragStart,
   onDragOver,
   onDrop,
@@ -158,6 +162,13 @@ export function SceneCard({
           </Tooltip>
           <Space size={4}>
             {extraActions}
+            {onMergeNext ? (
+              <Tooltip title="与下一场合并">
+                <Typography.Link onClick={onMergeNext}>
+                  <MergeCellsOutlined />
+                </Typography.Link>
+              </Tooltip>
+            ) : null}
             {onEdit ? (
               <Tooltip title="编辑场次">
                 <Typography.Link onClick={onEdit}>
