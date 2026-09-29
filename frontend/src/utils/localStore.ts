@@ -11,8 +11,10 @@ export const STORAGE_KEYS = {
   lastPlayId: 'lastPlayId',
   /** 最近导出存档的时间 */
   lastBackupAt: 'lastBackupAt',
-  /** 场次页表头偏好（是否只看本次排练勾选） */
+    /** 场次页表头偏好（是否只看本次排练勾选） */
   sceneOnlySelected: 'sceneOnlySelected',
+  /** 相邻场次合并的撤回记录（按剧目 id 保存合并前快照，仅最近一次） */
+  mergeUndo: 'mergeUndo',
 } as const;
 
 export type StorageKey = (typeof STORAGE_KEYS)[keyof typeof STORAGE_KEYS];

@@ -214,6 +214,109 @@ export async function removeCue(id: string): Promise<void> {
   await db.cues.delete(id);
 }
 
+/** 单剧目数据束（场次 + 角色 + 锣鼓点），供相邻场次合并与合并前快照使用 */
+export interface PlayBundle {
+  scenes: SceneRow[];
+  roles: RoleRow[];
+  cues: CueRow[];
+}
+
+/** 读取单剧目的完整数据束（按场序、秒点排好序），用于合并前快照与撤回核对 */
+export async function getPlayBundle(playId: string): Promise<PlayBundle> {
+  const scenes = await listScenesByPlay(playId);
+  if (scenes.length === 0) return { scenes: [], roles: [], cues: [] };
+  const sceneIds = scenes.map((scene) => scene.id);
+  const [roles, cues] = await Promise.all([listRolesByScenes(sceneIds), db.cues.where('sceneId').anyOf(sceneIds).toArray()]);
+  return {
+    scenes,
+    roles,
+    cues: cues.sort((a, b) => a.atSecond - b.atSecond),
+  };
+}
+
+/**
+ * 原子执行相邻场次合并：
+ * 一次事务内写合并场、迁移角色、顺延后场鼓点、删除次场、重排后续场序、同步剧目场次数。
+ * 任一步失败整体回滚，不会留下半套数据。所有写入行由 sceneMerge 统一预生成，
+ * 保证与内存里的「合并后预期数据束」逐字段一致，供撤回时核对。
+ */
+export async function mergeAdjacentScenesAtomic(input: {
+  playId: string;
+  mergedScene: SceneRow;
+  removedScene: SceneRow;
+  movedRoles: RoleRow[];
+  shiftedCues: CueRow[];
+  rescenes: SceneRow[];
+  nextSceneCount: number;
+}): Promise<void> {
+  const { playId, mergedScene, removedScene, movedRoles, shiftedCues, rescenes, nextSceneCount } = input;
+  await db.transaction('rw', db.plays, db.scenes, db.roles, db.cues, async () => {
+    const play = await db.plays.get(playId);
+    if (!play) throw new Error('未找到剧目，合并已取消');
+    const [left, right] = await Promise.all([db.scenes.get(mergedScene.id), db.scenes.get(removedScene.id)]);
+    if (!left || !right || left.playId !== playId || right.playId !== playId || right.seq !== left.seq + 1) {
+      throw new Error('待合并场次已变化或不再相邻，合并已取消');
+    }
+    // 角色与鼓点必须仍挂在次场名下，且数量与计划完全一致，
+    // 防止计划生成后数据被改过（新增/挪走）而漏迁或留下挂在已删场次上的孤儿行
+    const [ownedRoles, ownedCues, rightRoleCount, rightCueCount] = await Promise.all([
+      db.roles.where('id').anyOf(movedRoles.map((role) => role.id)).toArray(),
+      db.cues.where('id').anyOf(shiftedCues.map((cue) => cue.id)).toArray(),
+      db.roles.where('sceneId').equals(removedScene.id).count(),
+      db.cues.where('sceneId').equals(removedScene.id).count(),
+    ]);
+    const roleStillOnRight =
+      ownedRoles.length !== movedRoles.length ||
+      rightRoleCount !== movedRoles.length ||
+      ownedRoles.some((role) => role.sceneId !== removedScene.id);
+    const cueStillOnRight =
+      ownedCues.length !== shiftedCues.length ||
+      rightCueCount !== shiftedCues.length ||
+      ownedCues.some((cue) => cue.sceneId !== removedScene.id);
+    if (roleStillOnRight || cueStillOnRight) throw new Error('角色或锣鼓点归属已变化，合并已取消');
+
+    // 角色：原样迁入前场（只改 sceneId），保留全部影人字段不丢不漏
+    if (movedRoles.length > 0) await db.roles.bulkPut(movedRoles);
+    // 鼓点：后场鼓点整体顺延前场时长，前场鼓点不动
+    if (shiftedCues.length > 0) await db.cues.bulkPut(shiftedCues);
+
+    // 删除次场，并写回合并场与重排后的后续场次
+    await db.scenes.delete(removedScene.id);
+    await db.scenes.bulkPut([mergedScene, ...rescenes]);
+
+    // 同步剧目建档场次数
+    await db.plays.put({
+      ...play,
+      totalScenes: nextSceneCount,
+      updatedAt: nowIso(),
+      revision: ROW_REVISION,
+    });
+  });
+}
+
+/** 原子恢复单剧目数据束（撤回合并）：覆盖该剧目下的场次、角色与锣鼓点 */
+export async function restorePlayBundle(playId: string, bundle: PlayBundle, sceneCount: number): Promise<void> {
+  await db.transaction('rw', db.plays, db.scenes, db.roles, db.cues, async () => {
+    const play = await db.plays.get(playId);
+    if (!play) throw new Error('未找到剧目，撤回已取消');
+    const sceneIds = await db.scenes.where('playId').equals(playId).primaryKeys();
+    if (sceneIds.length > 0) {
+      await db.roles.where('sceneId').anyOf(sceneIds).delete();
+      await db.cues.where('sceneId').anyOf(sceneIds).delete();
+    }
+    await db.scenes.where('playId').equals(playId).delete();
+    await db.scenes.bulkPut(bundle.scenes);
+    await db.roles.bulkPut(bundle.roles);
+    await db.cues.bulkPut(bundle.cues);
+    await db.plays.put({
+      ...play,
+      totalScenes: sceneCount,
+      updatedAt: nowIso(),
+      revision: ROW_REVISION,
+    });
+  });
+}
+
 /* --------------------------- 整库导入导出 --------------------------- */
 
 export interface DatabaseSnapshot {
